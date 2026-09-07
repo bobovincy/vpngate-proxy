@@ -28,6 +28,17 @@ DEFAULT_CONFIG = {
     "subnet_prefix_length": 24,
     "health_check_timeout": 8,
     "preferred_nodes": [],
+    # 优选 IP / 节点质量
+    "prefer_quality_sort": True,
+    "filter_low_quality": True,
+    "precheck_nodes": True,
+    "node_probe_timeout": 2.5,
+    "min_node_score": 0,
+    "min_node_speed": 0,
+    "max_node_ping": 0,
+    "max_node_sessions": 0,
+    # 默认略抬高 JP（参考优质住宅线如 KDDI 121.109.x），可在设置里改成 [] 或其它国家
+    "quality_boost_countries": ["JP"],
     "connection_history_retention_days": 30,
     "socks_max_connections": 200,
     "reconnect_interval": 30

@@ -148,11 +148,115 @@ class VpnManager:
         except Exception as e:
             self.log(f"获取节点列表失败: {str(e)}")
 
-    def filter_nodes(self, region="all"):
+    @staticmethod
+    def _to_int(value, default=0):
+        try:
+            if value is None or value == "":
+                return default
+            return int(float(str(value).strip()))
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _to_float(value, default=0.0):
+        try:
+            if value is None or value == "":
+                return default
+            return float(str(value).strip())
+        except (TypeError, ValueError):
+            return default
+
+    def _has_openvpn_config(self, node):
+        if node.get("openvpn_config_base64"):
+            return True
+        ip = node.get("ip")
+        return bool(ip and ip in self._node_config_cache)
+
+    def _is_viable_node(self, node):
+        """过滤明显不可用的低质量节点，尽量靠近优质住宅线水准。"""
+        ip = (node.get("ip") or "").strip()
+        if not ip:
+            return False
+        if not self._has_openvpn_config(node):
+            return False
+        score = self._to_int(node.get("score"))
+        speed = self._to_int(node.get("speed"))
+        ping = self._to_int(node.get("ping"), default=-1)
+        sessions = self._to_int(node.get("num_sessions"))
+        min_score = self._to_int(self.config.get("min_node_score"), 0)
+        min_speed = self._to_int(self.config.get("min_node_speed"), 0)
+        max_ping = self._to_int(self.config.get("max_node_ping"), 0)
+        max_sessions = self._to_int(self.config.get("max_node_sessions"), 0)
+        if min_score and score < min_score:
+            return False
+        if min_speed and speed < min_speed:
+            return False
+        if max_ping > 0 and ping >= 0 and ping > max_ping:
+            return False
+        if max_sessions > 0 and sessions > max_sessions:
+            return False
+        # 无有效分数且无有效速率时视为劣质节点
+        if score <= 0 and speed <= 0:
+            return False
+        return True
+
+    def _node_quality_tuple(self, node):
+        """
+        质量排序键（越大越好）。
+        参考优质节点特征（如 121.109.224.163：高分、可用速率、低负载）：
+        Score / Speed 为主，Ping 与会话数为辅，国家加权可选。
+        """
+        score = self._to_float(node.get("score"))
+        speed = self._to_float(node.get("speed"))
+        ping = self._to_float(node.get("ping"), default=-1.0)
+        sessions = self._to_float(node.get("num_sessions"))
+        uptime = self._to_float(node.get("uptime"))
+
+        # ping<=0 在 VPNGate 常表示未知；给中性惩罚而不是当成最优
+        if ping < 0:
+            ping_score = 50.0
+        else:
+            ping_score = max(0.0, 300.0 - ping)
+
+        # 会话过多通常更卡
+        session_score = max(0.0, 100.0 - sessions)
+
+        country = (node.get("country_short") or "").upper()
+        boost_countries = self.config.get("quality_boost_countries") or ["JP"]
+        if isinstance(boost_countries, str):
+            boost_countries = [c.strip().upper() for c in boost_countries.split(",") if c.strip()]
+        else:
+            boost_countries = [str(c).strip().upper() for c in boost_countries if str(c).strip()]
+        country_boost = 1.0 if country in boost_countries else 0.0
+
+        # 归一化组合：Score/Speed 权重最高（与 VPNGate 官网排序一致）
+        quality = (
+            score * 1.0
+            + (speed / 1_000_000.0) * 0.35   # Mbps 量级加权
+            + ping_score * 800.0
+            + session_score * 500.0
+            + (uptime / 86_400_000.0) * 200.0  # 约按天
+            + country_boost * 50_000.0
+        )
+        # 返回 tuple 供稳定排序：quality desc, score desc, speed desc, ping asc, sessions asc
+        ping_for_sort = ping if ping >= 0 else 99999.0
+        return (quality, score, speed, -ping_for_sort, -sessions, uptime)
+
+    def rank_nodes(self, nodes):
+        """按质量降序排列；默认开启，可用 prefer_quality_sort=false 关闭。"""
+        if not self.config.get("prefer_quality_sort", True):
+            return list(nodes)
+        return sorted(nodes, key=self._node_quality_tuple, reverse=True)
+
+    def filter_nodes(self, region="all", *, viable_only=False, ranked=True):
         nodes = list(self.nodes)
-        if region == "all":
-            return nodes
-        return [n for n in nodes if (n.get("country_short") or "").upper() == region.upper()]
+        if region != "all":
+            nodes = [n for n in nodes if (n.get("country_short") or "").upper() == region.upper()]
+        if viable_only or self.config.get("filter_low_quality", True):
+            nodes = [n for n in nodes if self._is_viable_node(n)]
+        if ranked:
+            nodes = self.rank_nodes(nodes)
+        return nodes
 
     def detect_ip(self, ip):
         try:
@@ -176,8 +280,61 @@ class VpnManager:
             self.log(f"IP检测失败: {str(e)}")
             return None
 
+    def _extract_ovpn_remotes(self, node):
+        """从 OpenVPN 配置解析 remote 列表: [(host, port, proto), ...]"""
+        config_b64 = self._get_node_config(node)
+        if not config_b64:
+            return []
+        try:
+            content = base64.b64decode(config_b64).decode("utf-8", errors="ignore")
+        except Exception:
+            return []
+        remotes = []
+        default_proto = "udp"
+        for raw in content.splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            lower = line.lower()
+            if lower.startswith("proto "):
+                parts = line.split()
+                if len(parts) >= 2:
+                    default_proto = parts[1].split("-")[0].lower()
+                continue
+            if lower.startswith("remote "):
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+                host = parts[1]
+                port = 1194
+                proto = default_proto
+                if len(parts) >= 3 and parts[2].isdigit():
+                    port = int(parts[2])
+                if len(parts) >= 4:
+                    proto = parts[3].split("-")[0].lower()
+                remotes.append((host, port, proto))
+        return remotes
+
     def test_node(self, node):
-        return True
+        """连接前轻量探测：缺配置直接失败；TCP 端口可连则通过；纯 UDP 仅检查配置完整。"""
+        if not self._is_viable_node(node):
+            return False
+        remotes = self._extract_ovpn_remotes(node)
+        if not remotes:
+            # 无 remote 行时仍允许尝试（部分配置用 <connection> 块），交给 OpenVPN
+            return self._has_openvpn_config(node)
+        # 任一 TCP remote 可达即视为优质可用；全是 UDP 则不做误杀式探测
+        tcp_remotes = [(h, p) for h, p, proto in remotes if proto == "tcp"]
+        if not tcp_remotes:
+            return True
+        timeout = float(self.config.get("node_probe_timeout", 2.5))
+        for host, port in tcp_remotes[:3]:
+            try:
+                with socket.create_connection((host, port), timeout=timeout):
+                    return True
+            except OSError:
+                continue
+        return False
 
     def _get_tun_info(self):
         try:
@@ -736,7 +893,7 @@ class VpnManager:
                 if self._stop_event.is_set():
                     return
                 time.sleep(1)
-            nodes = self.filter_nodes(self.config.get("region", "all"))
+            nodes = self.filter_nodes(self.config.get("region", "all"), viable_only=True, ranked=True)
             available = []
             check_limit = self.config.get("check_limit", 20)
             for node in nodes[:check_limit]:
@@ -781,7 +938,8 @@ class VpnManager:
         策略：
         1. 如果设置了优先节点，始终优先从它们之中选择（跳过当前IP）。
         2. 若所有优先节点均不可用（连接失败或已在黑名单），则降级到普通节点列表。
-        3. 普通节点列表根据地区、子网优先等设置筛选。
+        3. 普通节点按质量优选（Score/Speed/Ping/会话/uptime，默认可过滤劣质节点），
+           并支持同子网优先与 TCP 预检。
         4. 限制最大尝试次数，防止风暴循环。
         """
         # 获取当前连接（或最后尝试）的IP
@@ -845,32 +1003,23 @@ class VpnManager:
 
             self.log("所有优先节点均连接失败，降级到普通节点列表...")
 
-        # ---------- 普通节点列表 ----------
+        # ---------- 普通节点列表（按质量优选） ----------
         region = self.config.get("region", "all")
-        nodes = self.filter_nodes(region)
+        nodes = self.filter_nodes(region, viable_only=True, ranked=True)
         if not nodes:
             self.log("自动连接失败：当前地区没有可用节点")
             return False, "当前地区没有可用节点"
 
-        # 确定普通节点的起始位置（跳过上次使用的IP）
-        start_index = 0
-        if last_ip:
-            for i, node in enumerate(nodes):
-                if node.get("ip") == last_ip:
-                    start_index = i + 1
-                    break
-
         prefer_same_subnet = self.config.get("prefer_same_subnet", False)
         subnet_prefix = self.config.get("subnet_prefix_length", 24)
 
-        # 收集候选节点（不在黑名单中且不是当前IP）
+        # 收集候选节点（不在黑名单中且不是当前IP），已按质量降序
         candidates = []
-        for i in range(len(nodes)):
-            idx = (start_index + i) % len(nodes)
-            node = nodes[idx]
-            if node.get("ip") == last_ip:
+        for node in nodes:
+            node_ip = node.get("ip")
+            if node_ip == last_ip:
                 continue
-            if node.get("ip") in self._failed_ips:
+            if node_ip in self._failed_ips:
                 continue
             candidates.append(node)
 
@@ -878,7 +1027,7 @@ class VpnManager:
             self.log("自动连接失败：没有其他可用节点")
             return False, "没有其他可用节点"
 
-        # 同子网优先排序
+        # 同子网优先：同子网内仍按质量排序，再拼其他优质节点
         if prefer_same_subnet and last_ip:
             subnet_nodes = []
             other_nodes = []
@@ -889,7 +1038,28 @@ class VpnManager:
                     subnet_nodes.append(node)
                 else:
                     other_nodes.append(node)
-            candidates = subnet_nodes + other_nodes
+            candidates = self.rank_nodes(subnet_nodes) + self.rank_nodes(other_nodes)
+
+        # 连接前做轻量探测，跳过明显不可达的 TCP 节点，减少劣质 IP 浪费尝试次数
+        precheck = self.config.get("precheck_nodes", True)
+        if precheck:
+            probed = []
+            for node in candidates:
+                if self.test_node(node):
+                    probed.append(node)
+                else:
+                    self.log(f"预检跳过低质/不可达节点: {node.get('hostname', '未知')} ({node.get('ip', '')})")
+            if probed:
+                candidates = probed
+            else:
+                self.log("预检后无剩余节点，回退到质量排序列表继续尝试")
+
+        if candidates:
+            top = candidates[0]
+            self.log(
+                f"优选候选 {len(candidates)} 个，首选: {top.get('hostname', '未知')} "
+                f"({top.get('ip', '')}) score={top.get('score')} speed={top.get('speed')} ping={top.get('ping')}"
+            )
 
         for node in candidates:
             if self._stop_event.is_set():
@@ -945,14 +1115,25 @@ class VpnManager:
                         break
                     self.log(f"优先节点 {node.get('hostname', '未知')} 连接失败")
 
-            # 优先节点都失败，尝试普通节点
+            # 优先节点都失败，尝试普通节点（质量降序 + 可选预检）
             if not connected and not self._stop_event.is_set():
-                nodes = self.filter_nodes(self.config.get("region", "all"))
+                nodes = self.filter_nodes(self.config.get("region", "all"), viable_only=True, ranked=True)
                 if nodes:
-                    self.log(f"第 {round_count} 轮：尝试普通节点...")
+                    self.log(f"第 {round_count} 轮：按质量优选普通节点（共 {len(nodes)} 个）...")
+                    attempt = 0
                     for node in nodes:
                         if self._stop_event.is_set():
                             break
+                        if attempt >= MAX_CONNECT_ATTEMPTS:
+                            self.log(f"已达到最大尝试次数 ({MAX_CONNECT_ATTEMPTS})")
+                            break
+                        if node.get("ip") in self._failed_ips:
+                            continue
+                        if self.config.get("precheck_nodes", True) and not self.test_node(node):
+                            self.log(f"预检跳过: {node.get('hostname', '未知')} ({node.get('ip', '')})")
+                            self._add_failed_ip(node.get("ip", ""))
+                            continue
+                        attempt += 1
                         if self.connect_node(node):
                             connected = True
                             break

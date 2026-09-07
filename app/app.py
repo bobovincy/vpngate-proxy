@@ -99,7 +99,7 @@ def status():
 def nodes():
     region = request.args.get("region", "all")
     try:
-        node_list = manager.filter_nodes(region)
+        node_list = manager.filter_nodes(region, viable_only=False, ranked=True)
         limit = int(manager.config.get("node_limit", 200))
         # 前端不需要 openvpn_config_base64，去除以节省带宽和前端内存
         display_fields = ("hostname", "ip", "score", "ping", "speed",
