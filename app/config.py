@@ -16,7 +16,7 @@ DEFAULT_CONFIG = {
     "node_limit": 200,
     "check_limit": 20,
     "secret_key": "",
-    "auto_update_interval": 0,
+    "auto_update_interval": 5,
     "health_fail_threshold": 3,
     "health_check_interval": 10,
     "log_retention_days": 3,
@@ -41,17 +41,25 @@ DEFAULT_CONFIG = {
     "quality_boost_countries": ["JP"],
     "connection_history_retention_days": 30,
     "socks_max_connections": 200,
-    "reconnect_interval": 30
+    "reconnect_interval": 30,
+    # IP 池：后台实时探测维护，程序通过 API 换出口
+    "pool_enabled": True,
+    "pool_refresh_interval": 60,
+    "pool_probe_limit": 80,
+    "pool_max_size": 100,
+    "auto_update_interval": 5,
+    "api_token": "",
 }
 
 # 不应通过 API 返回给前端的敏感字段
-SENSITIVE_KEYS = {"web_password", "vpn_pass", "secret_key"}
+SENSITIVE_KEYS = {"web_password", "vpn_pass", "secret_key", "api_token"}
 
 
 def load_config():
     if not os.path.exists(CONFIG_PATH):
         cfg = DEFAULT_CONFIG.copy()
         cfg["secret_key"] = secrets.token_hex(24)
+        cfg["api_token"] = secrets.token_hex(16)
         save_config(cfg)
         return cfg
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -60,6 +68,9 @@ def load_config():
         cfg.setdefault(k, v)
     if not cfg.get("secret_key"):
         cfg["secret_key"] = secrets.token_hex(24)
+        save_config(cfg)
+    if not cfg.get("api_token"):
+        cfg["api_token"] = secrets.token_hex(16)
         save_config(cfg)
     return cfg
 

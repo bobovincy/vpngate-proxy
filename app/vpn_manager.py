@@ -52,6 +52,11 @@ class VpnManager:
         self.max_health_fails = self.config.get("health_fail_threshold", 3)
         self.health_check_interval = self.config.get("health_check_interval", 10)
         self._available_nodes = []
+        self._ip_pool = []              # 探测通过的可用 IP 池（不含完整 ovpn 大字段也可，但保留 config 便于切换）
+        self._pool_lock = threading.Lock()
+        self._pool_updated_at = None
+        self._pool_refreshing = False
+        self._rotate_lock = threading.Lock()
         self.policy_routing_set = False
         self._failed_ips = set()
         self.preferred_nodes = self.config.get("preferred_nodes", [])
@@ -885,25 +890,202 @@ class VpnManager:
                 self._switch_to_next_available()
                 self.health_fail_count = 0
 
+    def _slim_pool_node(self, node, probed=True):
+        return {
+            "hostname": node.get("hostname", ""),
+            "ip": node.get("ip", ""),
+            "score": node.get("score", ""),
+            "ping": node.get("ping", ""),
+            "speed": node.get("speed", ""),
+            "country_long": node.get("country_long", ""),
+            "country_short": node.get("country_short", ""),
+            "num_sessions": node.get("num_sessions", ""),
+            "uptime": node.get("uptime", ""),
+            "probed": bool(probed),
+            "openvpn_config_base64": node.get("openvpn_config_base64")
+                or self._node_config_cache.get(node.get("ip"), ""),
+        }
+
+    def get_ip_pool(self):
+        with self._pool_lock:
+            pool = list(self._ip_pool)
+            updated = self._pool_updated_at
+        # API 不返回超大 base64，除非明确需要
+        public = []
+        for n in pool:
+            public.append({k: v for k, v in n.items() if k != "openvpn_config_base64"})
+        return {
+            "count": len(public),
+            "updated_at": updated,
+            "refreshing": self._pool_refreshing,
+            "ips": public,
+        }
+
+    def refresh_ip_pool(self, force_fetch=False):
+        """拉取/过滤/探测节点，更新实时 IP 池。"""
+        if not self.config.get("pool_enabled", True):
+            return self.get_ip_pool()
+        if self._pool_refreshing and not force_fetch:
+            return self.get_ip_pool()
+        self._pool_refreshing = True
+        try:
+            if force_fetch or not self.nodes:
+                self.fetch_nodes()
+            region = self.config.get("region", "all")
+            candidates = self.filter_nodes(region, viable_only=True, ranked=True)
+            probe_limit = int(self.config.get("pool_probe_limit", self.config.get("check_limit", 80)))
+            max_size = int(self.config.get("pool_max_size", 100))
+            to_probe = candidates[:max(probe_limit, 1)]
+            self.log(f"IP 池刷新：候选 {len(candidates)}，探测前 {len(to_probe)} 个")
+
+            passed = []
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            def probe(node):
+                if self._stop_event.is_set():
+                    return None
+                # 当前已连接节点直接入池，避免误踢
+                cur = (self.status.get("node_info") or {}).get("ip")
+                if cur and node.get("ip") == cur:
+                    return self._slim_pool_node(node, probed=True)
+                if self.config.get("precheck_nodes", True):
+                    ok = self.test_node(node)
+                else:
+                    ok = self._is_viable_node(node)
+                if not ok:
+                    return None
+                # 缓存 ovpn 配置，换 IP 时用
+                self._cache_node_config(node)
+                return self._slim_pool_node(node, probed=True)
+
+            workers = min(20, max(4, len(to_probe) or 1))
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                futs = [ex.submit(probe, n) for n in to_probe]
+                for fut in as_completed(futs):
+                    if self._stop_event.is_set():
+                        break
+                    try:
+                        item = fut.result()
+                    except Exception:
+                        item = None
+                    if item and item.get("ip"):
+                        passed.append(item)
+
+            # 去重并按质量再排
+            by_ip = {}
+            for n in passed:
+                by_ip[n["ip"]] = n
+            ranked = self.rank_nodes(list(by_ip.values()))[:max_size]
+            now = datetime.now(timezone.utc).isoformat()
+            with self._pool_lock:
+                self._ip_pool = ranked
+                self._pool_updated_at = now
+                self._available_nodes = ranked
+            self.log(f"IP 池已更新：{len(ranked)} 个可用节点")
+            return self.get_ip_pool()
+        finally:
+            self._pool_refreshing = False
+
+    def pick_from_pool(self, exclude_ips=None):
+        exclude = set(exclude_ips or [])
+        with self._pool_lock:
+            pool = list(self._ip_pool)
+        picks = []
+        for n in pool:
+            ip = n.get("ip")
+            if not ip or ip in exclude or ip in self._failed_ips:
+                continue
+            # 补全配置
+            if not n.get("openvpn_config_base64"):
+                n["openvpn_config_base64"] = self._node_config_cache.get(ip, "")
+            if not n.get("openvpn_config_base64"):
+                # 从全量 nodes 找
+                for full in self.nodes:
+                    if full.get("ip") == ip and full.get("openvpn_config_base64"):
+                        n["openvpn_config_base64"] = full["openvpn_config_base64"]
+                        break
+            if n.get("openvpn_config_base64"):
+                picks.append(n)
+        return picks
+
+    def change_ip(self, exclude_current=True):
+        """
+        从 IP 池选择另一个节点，切换唯一 SOCKS5 出口（单隧道）。
+        供外部程序调用。
+        """
+        if not self._rotate_lock.acquire(blocking=False):
+            return False, {"error": "正在切换中，请稍后重试"}
+        try:
+            last_ip = None
+            if exclude_current:
+                if self.current_node:
+                    last_ip = self.current_node.get("ip")
+                elif self.status.get("node_info"):
+                    last_ip = self.status["node_info"].get("ip")
+
+            # 池空则先刷新
+            with self._pool_lock:
+                empty = len(self._ip_pool) == 0
+            if empty:
+                self.log("IP 池为空，先刷新再换 IP")
+                self.refresh_ip_pool(force_fetch=True)
+
+            exclude = {last_ip} if last_ip else set()
+            candidates = self.pick_from_pool(exclude_ips=exclude)
+            if not candidates:
+                # 放宽：清空失败黑名单后再取
+                self._failed_ips.clear()
+                candidates = self.pick_from_pool(exclude_ips=exclude)
+            if not candidates:
+                return False, {"error": "IP 池中没有可切换节点", "pool": self.get_ip_pool()}
+
+            max_try = min(MAX_CONNECT_ATTEMPTS, len(candidates))
+            self.log(f"收到换 IP 请求，池内候选 {len(candidates)}，最多尝试 {max_try} 个")
+            for node in candidates[:max_try]:
+                if self._stop_event.is_set():
+                    break
+                ip = node.get("ip")
+                host = node.get("hostname", "未知")
+                self.log(f"换 IP 尝试: {host} ({ip})")
+                self._add_failed_ip(ip)
+                if self.connect_node(node):
+                    socks = self.status.get("socks", "")
+                    info = {
+                        "success": True,
+                        "ip": ip,
+                        "hostname": host,
+                        "country": node.get("country_short", ""),
+                        "socks": socks,
+                        "connected": True,
+                        "score": node.get("score"),
+                        "ping": node.get("ping"),
+                        "speed": node.get("speed"),
+                    }
+                    self.log(f"换 IP 成功: {host} ({ip})")
+                    return True, info
+            return False, {"error": "尝试池内节点均失败", "pool_count": len(candidates)}
+        finally:
+            self._rotate_lock.release()
+
     def background_check_nodes(self):
-        """后台节点扫描（目前 test_node 始终返回 True，此线程仅预热节点列表）"""
+        """后台实时维护 IP 池：周期性拉表 + 探测。"""
+        # 启动后稍等，避免和首次 connect 抢资源；随后立刻建池
+        for _ in range(5):
+            if self._stop_event.is_set():
+                return
+            time.sleep(1)
         while not self._stop_event.is_set():
-            # 每 5 分钟扫描一次，而非 60 秒，减少无意义 CPU 开销
-            for _ in range(300):
+            if self.config.get("pool_enabled", True):
+                try:
+                    self.refresh_ip_pool(force_fetch=False)
+                except Exception as e:
+                    self.log(f"IP 池刷新失败: {e}")
+            interval = int(self.config.get("pool_refresh_interval", 60))
+            interval = max(15, interval)
+            for _ in range(interval):
                 if self._stop_event.is_set():
                     return
                 time.sleep(1)
-            nodes = self.filter_nodes(self.config.get("region", "all"), viable_only=True, ranked=True)
-            available = []
-            check_limit = self.config.get("check_limit", 20)
-            for node in nodes[:check_limit]:
-                if self._stop_event.is_set():
-                    return
-                if self.status["connected"] and node.get("ip") == self.status["node_info"].get("ip"):
-                    continue
-                if self.test_node(node):
-                    available.append(node)
-            self._available_nodes = available
 
     def _auto_update_loop(self):
         while not self._stop_event.is_set():
@@ -1002,6 +1184,25 @@ class VpnManager:
                     return True, node_hostname
 
             self.log("所有优先节点均连接失败，降级到普通节点列表...")
+
+        # ---------- 优先从实时 IP 池选择 ----------
+        pool_candidates = self.pick_from_pool(exclude_ips={last_ip} if last_ip else set())
+        if pool_candidates:
+            self.log(f"使用 IP 池候选 {len(pool_candidates)} 个进行自动连接")
+            for node in pool_candidates:
+                if self._stop_event.is_set():
+                    break
+                if attempt_count >= MAX_CONNECT_ATTEMPTS:
+                    self.log(f"已达到最大尝试次数 ({MAX_CONNECT_ATTEMPTS})，停止尝试")
+                    return False, "达到最大尝试次数"
+                attempt_count += 1
+                node_ip = node.get("ip", "")
+                node_hostname = node.get("hostname", "未知")
+                self._add_failed_ip(node_ip)
+                self.log(f"IP 池连接尝试: {node_hostname} ({node_ip})")
+                if self.connect_node(node):
+                    return True, node_hostname
+            self.log("IP 池候选均失败，回退到全量质量排序列表...")
 
         # ---------- 普通节点列表（按质量优选） ----------
         region = self.config.get("region", "all")

@@ -57,15 +57,29 @@ def push_log(msg):
 
 manager.set_log_callback(push_log)
 
+def _api_token_ok():
+    """程序调用可用 Header: X-API-Token 或 Authorization: Bearer <token>"""
+    cfg = load_config()
+    expected = (cfg.get("api_token") or "").strip()
+    if not expected:
+        return False
+    got = (request.headers.get("X-API-Token") or "").strip()
+    if not got:
+        auth = request.headers.get("Authorization") or ""
+        if auth.lower().startswith("bearer "):
+            got = auth[7:].strip()
+    return bool(got) and secrets.compare_digest(got, expected)
+
+
 def login_required(f):
     from functools import wraps
     @wraps(f)
     def decorated(*args, **kwargs):
-        if not session.get("logged_in"):
-            if request.path.startswith("/api/"):
-                return jsonify({"error": "未登录"}), 401
-            return redirect(url_for("login"))
-        return f(*args, **kwargs)
+        if session.get("logged_in") or _api_token_ok():
+            return f(*args, **kwargs)
+        if request.path.startswith("/api/"):
+            return jsonify({"error": "未登录或 API Token 无效"}), 401
+        return redirect(url_for("login"))
     return decorated
 
 @app.route("/login", methods=["GET", "POST"])
@@ -92,7 +106,11 @@ def index():
 @app.route("/api/status")
 @login_required
 def status():
-    return jsonify(manager.status)
+    data = dict(manager.status)
+    pool = manager.get_ip_pool()
+    data["pool_count"] = pool.get("count", 0)
+    data["pool_updated_at"] = pool.get("updated_at")
+    return jsonify(data)
 
 @app.route("/api/nodes")
 @login_required
@@ -178,6 +196,58 @@ def auto_connect():
         return jsonify({"success": True, "node": msg})
     else:
         return jsonify({"success": False, "error": msg})
+
+
+@app.route("/api/pool", methods=["GET"])
+@login_required
+def api_pool():
+    """查看实时 IP 池"""
+    return jsonify(manager.get_ip_pool())
+
+
+@app.route("/api/pool/refresh", methods=["POST"])
+@login_required
+def api_pool_refresh():
+    """强制刷新 IP 池（拉表 + 探测）"""
+    pool = manager.refresh_ip_pool(force_fetch=True)
+    return jsonify({"success": True, "pool": pool})
+
+
+@app.route("/api/proxy", methods=["GET"])
+@login_required
+def api_proxy():
+    """当前 SOCKS5 出口信息（程序直接用）"""
+    st = manager.status
+    node = st.get("node_info") or {}
+    port = manager.config.get("socks_port", 1080)
+    # 对外地址用请求 Host，避免返回容器内网 IP
+    host = (request.host or "").split(":")[0] or "127.0.0.1"
+    public_socks = f"socks5://{host}:{port}"
+    return jsonify({
+        "connected": bool(st.get("connected")),
+        "socks": public_socks,
+        "socks_internal": st.get("socks"),
+        "socks_port": port,
+        "ip": node.get("ip"),
+        "hostname": node.get("hostname"),
+        "country": node.get("country_short") or node.get("country_long"),
+        "score": node.get("score"),
+        "connected_since": st.get("connected_since"),
+        "pool_count": manager.get_ip_pool().get("count", 0),
+    })
+
+
+@app.route("/api/change_ip", methods=["POST"])
+@login_required
+def api_change_ip():
+    """从 IP 池切换到另一个出口（单隧道 SOCKS5）"""
+    success, info = manager.change_ip(exclude_current=True)
+    code = 200 if success else 503
+    if isinstance(info, dict):
+        info.setdefault("success", success)
+        return jsonify(info), code
+    return jsonify({"success": success, "message": str(info)}), code
+
 
 @app.route("/api/system")
 @login_required

@@ -62,6 +62,60 @@ docker compose up -d --build
 
 ---
 
+## 🔌 IP 池 API（给外部程序用）
+
+服务端后台实时探测 VPN Gate 节点，维护 **IP 池**；对外仍是 **一条 SOCKS5 隧道**。你的程序需要换出口时调用换 IP 接口，服务端从池里选一个新节点切换。
+
+鉴权：请求头带 Token（启动后写在 `/data/config.json` 的 `api_token`，或面板配置里）：
+
+```http
+X-API-Token: <你的 api_token>
+```
+
+或：
+
+```http
+Authorization: Bearer <你的 api_token>
+```
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/pool` | 查看当前 IP 池 |
+| POST | `/api/pool/refresh` | 强制刷新池（拉表+探测） |
+| GET | `/api/proxy` | 当前出口 IP / SOCKS 信息 |
+| POST | `/api/change_ip` | **换 IP**：从池中选另一个节点切换 SOCKS 出口 |
+| GET | `/api/status` | 连接状态（含 `pool_count`） |
+
+示例：
+
+```bash
+TOKEN=你的api_token
+HOST=你的VPS_IP
+
+# 看池子
+curl -s -H "X-API-Token: $TOKEN" http://$HOST:8080/api/pool | jq
+
+# 看当前代理出口
+curl -s -H "X-API-Token: $TOKEN" http://$HOST:8080/api/proxy | jq
+
+# 换 IP（单隧道切换）
+curl -s -X POST -H "X-API-Token: $TOKEN" http://$HOST:8080/api/change_ip | jq
+```
+
+程序侧 SOCKS 一直连：`socks5://$HOST:1080`（端口不变，换的是出口 IP）。
+
+相关配置（`/data/config.json`）：
+
+| 字段 | 默认 | 含义 |
+|------|------|------|
+| `pool_enabled` | `true` | 开启 IP 池 |
+| `pool_refresh_interval` | `60` | 池刷新间隔（秒，最小 15） |
+| `pool_probe_limit` | `80` | 每次最多探测多少候选 |
+| `pool_max_size` | `100` | 池最大容量 |
+| `api_token` | 自动生成 | 程序调用鉴权 |
+
+---
+
 ## 🚀 快速开始
 
 ### 前提条件
