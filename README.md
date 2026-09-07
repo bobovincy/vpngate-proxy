@@ -25,6 +25,43 @@
 
 ---
 
+## ⭐ 本仓库改动（优选 IP）
+
+相对上游，本仓库强化了节点优选逻辑：
+
+- 按 Score / Speed / Ping / 会话数 / Uptime 质量排序，不再盲跟 API 原始顺序
+- 过滤缺配置、零分零速等劣质节点；可选 TCP 预检
+- 默认对 `JP` 略加权（可按 `quality_boost_countries` 调整）
+
+Docker 部署（推荐）：
+
+```bash
+mkdir -p ~/vpngate-proxy/data && cd ~/vpngate-proxy
+cat > docker-compose.yml <<'YAML'
+services:
+  vpn-proxy:
+    build: https://github.com/bobovincy/vpngate-proxy.git#main
+    image: vpngate-proxy:local
+    container_name: vpn-proxy
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    ports:
+      - "8080:8080"
+      - "1080:1080"
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
+YAML
+docker compose up -d --build
+```
+
+面板：`http://服务器IP:8080`（默认密码 `admin`）  
+代理：`socks5://服务器IP:1080`
+
+---
+
 ## 🚀 快速开始
 
 ### 前提条件
