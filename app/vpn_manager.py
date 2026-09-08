@@ -53,6 +53,7 @@ class VpnManager:
         self.health_check_interval = self.config.get("health_check_interval", 10)
         self._available_nodes = []
         self._ip_pool = []              # 探测通过的可用 IP 池（不含完整 ovpn 大字段也可，但保留 config 便于切换）
+        self._geo_cache = {}            # ip -> (ts, geo dict)
         self._pool_lock = threading.Lock()
         self._pool_updated_at = None
         self._pool_refreshing = False
@@ -284,6 +285,108 @@ class VpnManager:
         except Exception as e:
             self.log(f"IP检测失败: {str(e)}")
             return None
+
+    @staticmethod
+    def _residential_score(geo):
+        """家宽启发式：日本常见宽带运营商加分，机房/云厂商减分。"""
+        blob = " ".join([
+            str(geo.get("isp") or ""),
+            str(geo.get("org") or ""),
+            str(geo.get("as") or ""),
+        ]).lower()
+        residential = (
+            "kddi", "ntt", "softbank", "ocn", "so-net", "sonet", "biglobe",
+            "j:com", "jcom", "plala", "asahi", "nifty", "yahoo", "commufa",
+            "iij", "bbix", "eonet", "opticom", "k-opticom", "dti", "hi-ho",
+            "wakwak", "gmobb", "au one", "au hikari", "flets", "フレッツ",
+            "光", "fiber", "broadband",
+        )
+        datacenter = (
+            "amazon", "aws", "google", "microsoft", "azure", "digitalocean",
+            "linode", "ovh", "hetzner", "alibaba", "tencent", "oracle",
+            "choopa", "vultr", "contabo", "leaseweb", "m247", "datacamp",
+            "hosting", "datacenter", "data center", "colocation", "cloud",
+            "vps", "softlayer", "akamai", "cdn", "university", "academic",
+            "opengw", "softether",
+        )
+        score = 0
+        if any(k in blob for k in residential):
+            score += 2
+        if any(k in blob for k in datacenter):
+            score -= 3
+        return score
+
+    def _geo_passes(self, geo):
+        if not geo or geo.get("status") != "success":
+            return False
+        want = (self.config.get("pool_country") or "JP").upper()
+        if want and want != "ALL":
+            cc = (geo.get("countryCode") or "").upper()
+            if cc != want:
+                return False
+        if self.config.get("pool_reject_proxy", True) and geo.get("proxy"):
+            return False
+        if self.config.get("pool_reject_hosting", True) and geo.get("hosting"):
+            return False
+        if self.config.get("pool_reject_mobile", True) and geo.get("mobile"):
+            return False
+        return True
+
+    def _lookup_geo_batch(self, ips):
+        """批量查 ip-api，带缓存。返回 {ip: geo}。"""
+        now = time.time()
+        ttl = int(self.config.get("pool_geo_cache_ttl", 21600))
+        out = {}
+        missing = []
+        for ip in ips:
+            if not ip:
+                continue
+            cached = self._geo_cache.get(ip)
+            if cached and now - cached[0] < ttl:
+                out[ip] = cached[1]
+            else:
+                missing.append(ip)
+        if not missing:
+            return out
+
+        url = (
+            "http://ip-api.com/batch"
+            "?fields=status,message,country,countryCode,regionName,city,isp,org,as,proxy,hosting,mobile,query"
+        )
+        for i in range(0, len(missing), 100):
+            chunk = missing[i:i + 100]
+            try:
+                resp = requests.post(url, json=chunk, timeout=20)
+                if resp.status_code == 429:
+                    self.log("ip-api 频率限制，稍后重试剩余 IP")
+                    time.sleep(2)
+                    resp = requests.post(url, json=chunk, timeout=20)
+                rows = resp.json() if resp.ok else []
+                if not isinstance(rows, list):
+                    self.log(f"ip-api 批量查询异常: {resp.status_code}")
+                    continue
+                for row in rows:
+                    ip = (row or {}).get("query")
+                    if not ip:
+                        continue
+                    self._geo_cache[ip] = (now, row)
+                    out[ip] = row
+            except Exception as e:
+                self.log(f"ip-api 批量查询失败: {e}")
+        return out
+
+    def _attach_geo(self, item, geo):
+        item = dict(item)
+        item["geo_country"] = geo.get("countryCode") or ""
+        item["city"] = geo.get("city") or ""
+        item["isp"] = geo.get("isp") or ""
+        item["org"] = geo.get("org") or ""
+        item["proxy"] = bool(geo.get("proxy"))
+        item["hosting"] = bool(geo.get("hosting"))
+        item["mobile"] = bool(geo.get("mobile"))
+        item["residential_score"] = self._residential_score(geo)
+        item["residential"] = item["residential_score"] > 0 and not item["proxy"] and not item["hosting"]
+        return item
 
     def _extract_ovpn_remotes(self, node):
         """从 OpenVPN 配置解析 remote 列表: [(host, port, proto), ...]"""
@@ -931,7 +1034,7 @@ class VpnManager:
         try:
             if force_fetch or not self.nodes:
                 self.fetch_nodes()
-            region = self.config.get("region", "all")
+            region = (self.config.get("pool_country") or self.config.get("region") or "JP")
             candidates = self.filter_nodes(region, viable_only=True, ranked=True)
             probe_limit = int(self.config.get("pool_probe_limit", self.config.get("check_limit", 80)))
             max_size = int(self.config.get("pool_max_size", 100))
@@ -944,10 +1047,6 @@ class VpnManager:
             def probe(node):
                 if self._stop_event.is_set():
                     return None
-                # 当前已连接节点直接入池，避免误踢
-                cur = (self.status.get("node_info") or {}).get("ip")
-                if cur and node.get("ip") == cur:
-                    return self._slim_pool_node(node, probed=True)
                 if self.config.get("precheck_nodes", True):
                     ok = self.test_node(node)
                 else:
@@ -971,17 +1070,53 @@ class VpnManager:
                     if item and item.get("ip"):
                         passed.append(item)
 
-            # 去重并按质量再排
+            # 去重
             by_ip = {}
             for n in passed:
                 by_ip[n["ip"]] = n
-            ranked = self.rank_nodes(list(by_ip.values()))[:max_size]
+
+            geos = self._lookup_geo_batch(list(by_ip.keys()))
+            qualified = []
+            dropped = {"country": 0, "proxy": 0, "hosting": 0, "mobile": 0, "unknown": 0}
+            for ip, node in by_ip.items():
+                geo = geos.get(ip)
+                if not geo:
+                    dropped["unknown"] += 1
+                    continue
+                if not self._geo_passes(geo):
+                    if (geo.get("countryCode") or "").upper() != (self.config.get("pool_country") or "JP").upper():
+                        dropped["country"] += 1
+                    elif geo.get("proxy"):
+                        dropped["proxy"] += 1
+                    elif geo.get("hosting"):
+                        dropped["hosting"] += 1
+                    elif geo.get("mobile"):
+                        dropped["mobile"] += 1
+                    else:
+                        dropped["unknown"] += 1
+                    continue
+                qualified.append(self._attach_geo(node, geo))
+
+            # 家宽优先，再按原质量分
+            if self.config.get("pool_prefer_residential", True):
+                qualified.sort(
+                    key=lambda n: (n.get("residential_score") or 0, self._node_quality_tuple(n)),
+                    reverse=True,
+                )
+            else:
+                qualified = self.rank_nodes(qualified)
+            ranked = qualified[:max_size]
             now = datetime.now(timezone.utc).isoformat()
             with self._pool_lock:
                 self._ip_pool = ranked
                 self._pool_updated_at = now
                 self._available_nodes = ranked
-            self.log(f"IP 池已更新：{len(ranked)} 个可用节点")
+            res_n = sum(1 for n in ranked if n.get("residential"))
+            self.log(
+                f"IP 池已更新：{len(ranked)} 个（家宽优先 {res_n}），"
+                f"剔除 国家{dropped['country']} 代理{dropped['proxy']} "
+                f"机房{dropped['hosting']} 移动{dropped['mobile']} 未知{dropped['unknown']}"
+            )
             return self.get_ip_pool()
         finally:
             self._pool_refreshing = False
@@ -1202,10 +1337,15 @@ class VpnManager:
                 self.log(f"IP 池连接尝试: {node_hostname} ({node_ip})")
                 if self.connect_node(node):
                     return True, node_hostname
-            self.log("IP 池候选均失败，回退到全量质量排序列表...")
+            self.log("IP 池候选均失败，仅使用已通过日本/非VPN/非机房检测的池，不再回退劣质 IP")
+
+        # 出口质量过滤开启时，不允许回退到未检测节点（否则会连上美国/被标 VPN 的地址）
+        if self.config.get("pool_reject_proxy", True):
+            self.log("自动连接失败：合格 IP 池暂无可用节点，等待下一轮池刷新")
+            return False, "合格 IP 池暂无可用节点"
 
         # ---------- 普通节点列表（按质量优选） ----------
-        region = self.config.get("region", "all")
+        region = self.config.get("pool_country") or self.config.get("region", "JP")
         nodes = self.filter_nodes(region, viable_only=True, ranked=True)
         if not nodes:
             self.log("自动连接失败：当前地区没有可用节点")
@@ -1316,11 +1456,19 @@ class VpnManager:
                         break
                     self.log(f"优先节点 {node.get('hostname', '未知')} 连接失败")
 
-            # 优先节点都失败，尝试普通节点（质量降序 + 可选预检）
+            # 只连合格 IP 池：日本、非代理/VPN、非机房，家宽优先
             if not connected and not self._stop_event.is_set():
-                nodes = self.filter_nodes(self.config.get("region", "all"), viable_only=True, ranked=True)
+                with self._pool_lock:
+                    empty = len(self._ip_pool) == 0
+                if empty:
+                    self.log(f"第 {round_count} 轮：IP 池为空，先刷新后再连...")
+                    try:
+                        self.refresh_ip_pool(force_fetch=True)
+                    except Exception as e:
+                        self.log(f"IP 池刷新失败: {e}")
+                nodes = self.pick_from_pool()
                 if nodes:
-                    self.log(f"第 {round_count} 轮：按质量优选普通节点（共 {len(nodes)} 个）...")
+                    self.log(f"第 {round_count} 轮：从合格 IP 池连接（共 {len(nodes)} 个）...")
                     attempt = 0
                     for node in nodes:
                         if self._stop_event.is_set():
@@ -1330,16 +1478,14 @@ class VpnManager:
                             break
                         if node.get("ip") in self._failed_ips:
                             continue
-                        if self.config.get("precheck_nodes", True) and not self.test_node(node):
-                            self.log(f"预检跳过: {node.get('hostname', '未知')} ({node.get('ip', '')})")
-                            self._add_failed_ip(node.get("ip", ""))
-                            continue
                         attempt += 1
                         if self.connect_node(node):
                             connected = True
                             break
                         self.log(f"节点 {node.get('hostname', '未知')} 连接失败，尝试下一个...")
                         time.sleep(1)
+                else:
+                    self.log("合格 IP 池暂无可用节点（日本 + 非VPN + 非机房）")
 
             if connected:
                 self.log("VPN 连接成功建立")

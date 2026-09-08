@@ -12,7 +12,7 @@ DEFAULT_CONFIG = {
     "web_port": 8080,
     "vpn_user": "",
     "vpn_pass": "",
-    "region": "all",
+    "region": "JP",
     "node_limit": 200,
     "check_limit": 20,
     "secret_key": "",
@@ -47,8 +47,14 @@ DEFAULT_CONFIG = {
     "pool_refresh_interval": 60,
     "pool_probe_limit": 80,
     "pool_max_size": 100,
-    "auto_update_interval": 5,
     "api_token": "",
+    # 出口质量：日本 + 非代理/VPN + 非机房，优先家宽
+    "pool_country": "JP",
+    "pool_reject_proxy": True,
+    "pool_reject_hosting": True,
+    "pool_reject_mobile": True,
+    "pool_prefer_residential": True,
+    "pool_geo_cache_ttl": 21600,
 }
 
 # 不应通过 API 返回给前端的敏感字段
