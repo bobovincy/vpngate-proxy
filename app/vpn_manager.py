@@ -533,7 +533,7 @@ class VpnManager:
         config_b64 = self._get_node_config(node)
         if not config_b64:
             self.log("未找到节点 OpenVPN 配置，无法连接")
-            self._add_failed_ip(ip)
+            self._mark_node_bad(ip, "missing ovpn")
             return False
 
         # 缓存配置供后续重连使用
@@ -543,7 +543,7 @@ class VpnManager:
             ovpn_content = base64.b64decode(config_b64).decode("utf-8")
         except Exception:
             self.log("解码 OpenVPN 配置失败")
-            self._add_failed_ip(ip)
+            self._mark_node_bad(ip, "bad ovpn")
             return False
 
         auth_path = "/tmp/vpn_auth.txt"
@@ -555,6 +555,10 @@ class VpnManager:
 
         ovpn_content += "\nroute-nopull\n"
         ovpn_content += "\ndata-ciphers AES-256-GCM:AES-128-GCM:AES-128-CBC:CHACHA20-POLY1305\n"
+        # 失败节点别长时间重试，尽快换池里下一个
+        ovpn_content += "\nconnect-retry-max 1\n"
+        ovpn_content += "\nconnect-retry 1\n"
+        ovpn_content += "\nresolv-retry 3\n"
 
         ovpn_path = "/tmp/vpn_config.ovpn"
         with open(ovpn_path, "w") as f:
@@ -568,7 +572,7 @@ class VpnManager:
             )
         except Exception as e:
             self.log(f"启动 OpenVPN 失败: {str(e)}")
-            self._add_failed_ip(ip)
+            self._mark_node_bad(ip, "start failed")
             return False
 
         tun_ip = None
@@ -576,12 +580,12 @@ class VpnManager:
         vpn_gateway = None
         connected_flag = False
         start_time = time.time()
-        timeout = 25
+        timeout = int(self.config.get("openvpn_connect_timeout", 18))
 
         while time.time() - start_time < timeout:
             if self.vpn_process.poll() is not None:
                 self.log("OpenVPN 进程已退出，连接失败")
-                self._add_failed_ip(ip)
+                self._mark_node_bad(ip, "openvpn exited")
                 self._cleanup_vpn_process()
                 return False
 
@@ -591,6 +595,21 @@ class VpnManager:
                 continue
 
             self.log(f"[OpenVPN] {line.strip()}")
+            low = line.lower()
+
+            # 连接重置 / 认证失败：立刻放弃，别等 Restart pause
+            if (
+                "connection reset" in low
+                or "auth_failed" in low
+                or "auth-failure" in low
+                or "tls handshake failed" in low
+                or "tls error" in low
+                or "fatal error" in low
+            ):
+                self.log(f"OpenVPN 快速失败: {line.strip()}")
+                self._mark_node_bad(ip, "openvpn fast-fail")
+                self.disconnect()
+                return False
 
             if "Peer Connection Initiated" in line:
                 self.log("TLS 握手成功，等待配置...")
@@ -620,12 +639,12 @@ class VpnManager:
                 tun_dev = sys_dev
             else:
                 self.log("无法从系统获取 VPN IP")
-                self._add_failed_ip(ip)
+                self._mark_node_bad(ip, "no tun ip")
                 self.disconnect()
                 return False
         else:
             self.log("获取 VPN IP 失败，无法启动 SOCKS5 代理")
-            self._add_failed_ip(ip)
+            self._mark_node_bad(ip, "connect timeout")
             self.disconnect()
             return False
 
@@ -653,6 +672,16 @@ class VpnManager:
         self.status["socks"] = f"socks5://{self._get_host_ip()}:{socks_port}"
         self.status["ip_info"] = self.detect_ip(ip)
         self.log(f"SOCKS5 代理已启动: {self.status['socks']}")
+
+        # 连上后再核一次出口画像：日本 / 非VPN / 非机房
+        if self.config.get("pool_verify_exit_geo", True):
+            geos = self._lookup_geo_batch([ip])
+            geo = geos.get(ip)
+            if not self._geo_passes(geo or {}):
+                self.log(f"出口画像不合格，断开并剔除: {ip} geo={geo}")
+                self._mark_node_bad(ip, "exit geo rejected")
+                self.disconnect()
+                return False
 
         self.status["connected_since"] = datetime.now(timezone.utc).isoformat()
         self.log(f"已记录连接开始时间: {self.status['connected_since']}")
@@ -855,11 +884,28 @@ class VpnManager:
 
     def _add_failed_ip(self, ip):
         """添加失败 IP，限制集合大小防止无限增长"""
+        if not ip:
+            return
         self._failed_ips.add(ip)
         if len(self._failed_ips) > MAX_FAILED_IPS:
             # 超过上限时清空一半（set 无序，无法精确保留"最近的"，但配合定期 clear 不影响功能）
             self._failed_ips.clear()
             self._failed_ips.add(ip)  # 保留当前这个
+
+    def _evict_from_pool(self, ip, reason=""):
+        if not ip:
+            return
+        with self._pool_lock:
+            before = len(self._ip_pool)
+            self._ip_pool = [n for n in self._ip_pool if n.get("ip") != ip]
+            after = len(self._ip_pool)
+        if before != after:
+            self.log(f"已从 IP 池剔除 {ip}" + (f"（{reason}）" if reason else "") + f"，剩余 {after}")
+
+    def _mark_node_bad(self, ip, reason=""):
+        """连接失败：进黑名单并从池中剔除，避免反复白试。"""
+        self._add_failed_ip(ip)
+        self._evict_from_pool(ip, reason=reason or "connect failed")
 
     def _is_tunnel_alive(self):
         # ---- 第一层：检查 OpenVPN 进程 ----
@@ -1174,31 +1220,43 @@ class VpnManager:
             if not candidates:
                 return False, {"error": "IP 池中没有可切换节点", "pool": self.get_ip_pool()}
 
-            max_try = min(MAX_CONNECT_ATTEMPTS, len(candidates))
-            self.log(f"收到换 IP 请求，池内候选 {len(candidates)}，最多尝试 {max_try} 个")
-            for node in candidates[:max_try]:
-                if self._stop_event.is_set():
+            for round_i in range(2):
+                candidates = self.pick_from_pool(exclude_ips=exclude)
+                if not candidates:
+                    self._failed_ips -= exclude  # 不清空 exclude，只是别被旧黑名单堵死过多
+                    self.log("换 IP：池空，强制刷新")
+                    self.refresh_ip_pool(force_fetch=True)
+                    candidates = self.pick_from_pool(exclude_ips=exclude)
+                if not candidates:
                     break
-                ip = node.get("ip")
-                host = node.get("hostname", "未知")
-                self.log(f"换 IP 尝试: {host} ({ip})")
-                self._add_failed_ip(ip)
-                if self.connect_node(node):
-                    socks = self.status.get("socks", "")
-                    info = {
-                        "success": True,
-                        "ip": ip,
-                        "hostname": host,
-                        "country": node.get("country_short", ""),
-                        "socks": socks,
-                        "connected": True,
-                        "score": node.get("score"),
-                        "ping": node.get("ping"),
-                        "speed": node.get("speed"),
-                    }
-                    self.log(f"换 IP 成功: {host} ({ip})")
-                    return True, info
-            return False, {"error": "尝试池内节点均失败", "pool_count": len(candidates)}
+                max_try = min(MAX_CONNECT_ATTEMPTS, len(candidates))
+                self.log(f"收到换 IP 请求，池内候选 {len(candidates)}，最多尝试 {max_try} 个（第 {round_i + 1} 轮）")
+                for node in candidates[:max_try]:
+                    if self._stop_event.is_set():
+                        break
+                    ip = node.get("ip")
+                    host = node.get("hostname", "未知")
+                    self.log(f"换 IP 尝试: {host} ({ip})")
+                    if self.connect_node(node):
+                        socks = self.status.get("socks", "")
+                        info = {
+                            "success": True,
+                            "ip": ip,
+                            "hostname": host,
+                            "country": node.get("country_short") or node.get("geo_country", ""),
+                            "socks": socks,
+                            "connected": True,
+                            "score": node.get("score"),
+                            "ping": node.get("ping"),
+                            "speed": node.get("speed"),
+                            "residential": node.get("residential"),
+                            "isp": node.get("isp"),
+                        }
+                        self.log(f"换 IP 成功: {host} ({ip})")
+                        return True, info
+                if round_i == 0:
+                    self.refresh_ip_pool(force_fetch=True)
+            return False, {"error": "尝试池内节点均失败", "pool": self.get_ip_pool()}
         finally:
             self._rotate_lock.release()
 
@@ -1212,10 +1270,19 @@ class VpnManager:
         while not self._stop_event.is_set():
             if self.config.get("pool_enabled", True):
                 try:
-                    self.refresh_ip_pool(force_fetch=False)
+                    # 池偏小时强制重新拉表，尽量补家宽日本节点
+                    with self._pool_lock:
+                        size = len(self._ip_pool)
+                    min_size = int(self.config.get("pool_min_size", 3))
+                    self.refresh_ip_pool(force_fetch=(size < min_size))
                 except Exception as e:
                     self.log(f"IP 池刷新失败: {e}")
-            interval = int(self.config.get("pool_refresh_interval", 60))
+            interval = int(self.config.get("pool_refresh_interval", 45))
+            with self._pool_lock:
+                size = len(self._ip_pool)
+            min_size = int(self.config.get("pool_min_size", 3))
+            if size < min_size:
+                interval = min(interval, 20)
             interval = max(15, interval)
             for _ in range(interval):
                 if self._stop_event.is_set():
@@ -1321,27 +1388,44 @@ class VpnManager:
             self.log("所有优先节点均连接失败，降级到普通节点列表...")
 
         # ---------- 优先从实时 IP 池选择 ----------
-        pool_candidates = self.pick_from_pool(exclude_ips={last_ip} if last_ip else set())
-        if pool_candidates:
-            self.log(f"使用 IP 池候选 {len(pool_candidates)} 个进行自动连接")
-            for node in pool_candidates:
-                if self._stop_event.is_set():
-                    break
-                if attempt_count >= MAX_CONNECT_ATTEMPTS:
-                    self.log(f"已达到最大尝试次数 ({MAX_CONNECT_ATTEMPTS})，停止尝试")
-                    return False, "达到最大尝试次数"
-                attempt_count += 1
-                node_ip = node.get("ip", "")
-                node_hostname = node.get("hostname", "未知")
-                self._add_failed_ip(node_ip)
-                self.log(f"IP 池连接尝试: {node_hostname} ({node_ip})")
-                if self.connect_node(node):
-                    return True, node_hostname
-            self.log("IP 池候选均失败，仅使用已通过日本/非VPN/非机房检测的池，不再回退劣质 IP")
+        for round_i in range(2):  # 第一轮用现池；失败后强制重刷再试一轮
+            pool_candidates = self.pick_from_pool(exclude_ips={last_ip} if last_ip else set())
+            if not pool_candidates and round_i == 0:
+                self.log("IP 池暂无可连节点，强制刷新后再试")
+                try:
+                    self.refresh_ip_pool(force_fetch=True)
+                except Exception as e:
+                    self.log(f"强制刷新失败: {e}")
+                pool_candidates = self.pick_from_pool(exclude_ips={last_ip} if last_ip else set())
+
+            if pool_candidates:
+                self.log(f"使用 IP 池候选 {len(pool_candidates)} 个进行自动连接（第 {round_i + 1} 轮）")
+                for node in pool_candidates:
+                    if self._stop_event.is_set():
+                        break
+                    if attempt_count >= MAX_CONNECT_ATTEMPTS:
+                        self.log(f"已达到最大尝试次数 ({MAX_CONNECT_ATTEMPTS})，停止尝试")
+                        return False, "达到最大尝试次数"
+                    attempt_count += 1
+                    node_ip = node.get("ip", "")
+                    node_hostname = node.get("hostname", "未知")
+                    self.log(f"IP 池连接尝试: {node_hostname} ({node_ip})")
+                    if self.connect_node(node):
+                        return True, node_hostname
+                    # connect_node 内部已 mark bad / 踢池
+                if round_i == 0:
+                    self.log("本轮池内节点均失败，强制刷新 IP 池后再试一轮")
+                    try:
+                        self.refresh_ip_pool(force_fetch=True)
+                    except Exception as e:
+                        self.log(f"强制刷新失败: {e}")
+                    continue
+
+            break
 
         # 出口质量过滤开启时，不允许回退到未检测节点（否则会连上美国/被标 VPN 的地址）
         if self.config.get("pool_reject_proxy", True):
-            self.log("自动连接失败：合格 IP 池暂无可用节点，等待下一轮池刷新")
+            self.log("自动连接失败：合格 IP 池暂无可用节点（日本/非VPN/非机房且能连上的太少）")
             return False, "合格 IP 池暂无可用节点"
 
         # ---------- 普通节点列表（按质量优选） ----------

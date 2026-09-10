@@ -44,8 +44,8 @@ DEFAULT_CONFIG = {
     "reconnect_interval": 30,
     # IP 池：后台实时探测维护，程序通过 API 换出口
     "pool_enabled": True,
-    "pool_refresh_interval": 60,
-    "pool_probe_limit": 80,
+    "pool_refresh_interval": 45,
+    "pool_probe_limit": 200,
     "pool_max_size": 100,
     "api_token": "",
     # 出口质量：日本 + 非代理/VPN + 非机房，优先家宽
@@ -55,6 +55,9 @@ DEFAULT_CONFIG = {
     "pool_reject_mobile": True,
     "pool_prefer_residential": True,
     "pool_geo_cache_ttl": 21600,
+    "pool_min_size": 3,
+    "pool_verify_exit_geo": True,
+    "openvpn_connect_timeout": 18,
 }
 
 # 不应通过 API 返回给前端的敏感字段
