@@ -69,8 +69,10 @@ docker compose up -d --build
 入池条件（默认）：
 
 - 国家必须是日本（`pool_country=JP`）
-- ip-api 检测：**代理/VPN = 否**、**机房/托管 = 否**、非移动网络
-- 家宽运营商（KDDI / NTT / SoftBank 等）优先排在池前面
+- **代理/VPN 标记默认放行**（`pool_reject_proxy=false`）
+- **机房/托管 = 否**，非移动网络
+- **要求像家宽**（ISP/ASN 启发式，KDDI/NTT/SoftBank 等优先）
+- 欺诈分：配置 `fraud_provider` + `fraud_api_key` 后启用（`ipqs` 或 `proxycheck`），默认 `max_fraud_score=25`
 
  VPN Gate 节点，维护 **IP 池**；对外仍是 **一条 SOCKS5 隧道**。你的程序需要换出口时调用换 IP 接口，服务端从池里选一个新节点切换。
 

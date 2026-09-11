@@ -54,6 +54,7 @@ class VpnManager:
         self._available_nodes = []
         self._ip_pool = []              # 探测通过的可用 IP 池（不含完整 ovpn 大字段也可，但保留 config 便于切换）
         self._geo_cache = {}            # ip -> (ts, geo dict)
+        self._fraud_cache = {}          # ip -> (ts, score)
         self._pool_lock = threading.Lock()
         self._pool_updated_at = None
         self._pool_refreshing = False
@@ -299,7 +300,7 @@ class VpnManager:
             "j:com", "jcom", "plala", "asahi", "nifty", "yahoo", "commufa",
             "iij", "bbix", "eonet", "opticom", "k-opticom", "dti", "hi-ho",
             "wakwak", "gmobb", "au one", "au hikari", "flets", "フレッツ",
-            "光", "fiber", "broadband",
+            "光", "fiber", "broadband", "vectant", "ucom", "itscom", "pikara",
         )
         datacenter = (
             "amazon", "aws", "google", "microsoft", "azure", "digitalocean",
@@ -307,16 +308,63 @@ class VpnManager:
             "choopa", "vultr", "contabo", "leaseweb", "m247", "datacamp",
             "hosting", "datacenter", "data center", "colocation", "cloud",
             "vps", "softlayer", "akamai", "cdn", "university", "academic",
-            "opengw", "softether",
+            "opengw", "softether", "server", "dedicated", "colo",
         )
         score = 0
         if any(k in blob for k in residential):
-            score += 2
+            score += 3
         if any(k in blob for k in datacenter):
-            score -= 3
+            score -= 4
+        if score == 0 and not geo.get("hosting") and not geo.get("mobile"):
+            score = 1
         return score
 
-    def _geo_passes(self, geo):
+    def _lookup_fraud_score(self, ip):
+        """查询欺诈分（0-100，越低越干净）。未配置 provider/key 时返回 None。"""
+        provider = (self.config.get("fraud_provider") or "none").strip().lower()
+        key = (self.config.get("fraud_api_key") or "").strip()
+        if provider in ("", "none") or not key:
+            return None
+        now = time.time()
+        ttl = int(self.config.get("fraud_cache_ttl", 86400))
+        cached = self._fraud_cache.get(ip)
+        if cached and now - cached[0] < ttl:
+            return cached[1]
+        score = None
+        try:
+            if provider == "ipqs":
+                url = f"https://ipqualityscore.com/api/json/ip/{key}/{ip}"
+                params = {
+                    "strictness": 1,
+                    "allow_public_access_points": "true",
+                    "lighter_penalties": "true",
+                }
+                resp = requests.get(url, params=params, timeout=12)
+                data = resp.json() if resp.ok else {}
+                if data.get("success") is False:
+                    self.log(f"IPQS 查询失败 {ip}: {data.get('message')}")
+                else:
+                    score = data.get("fraud_score")
+            elif provider == "proxycheck":
+                url = f"https://proxycheck.io/v2/{ip}"
+                params = {"key": key, "vpn": 1, "risk": 1, "asn": 1}
+                resp = requests.get(url, params=params, timeout=12)
+                data = resp.json() if resp.ok else {}
+                row = data.get(ip) if isinstance(data, dict) else None
+                if isinstance(row, dict):
+                    score = row.get("risk")
+            else:
+                self.log(f"未知 fraud_provider: {provider}")
+                return None
+            if score is not None:
+                score = int(float(score))
+                self._fraud_cache[ip] = (now, score)
+        except Exception as e:
+            self.log(f"欺诈分查询失败 {ip}: {e}")
+            return None
+        return score
+
+    def _geo_passes(self, geo, fraud_score=None):
         if not geo or geo.get("status") != "success":
             return False
         want = (self.config.get("pool_country") or "JP").upper()
@@ -324,12 +372,19 @@ class VpnManager:
             cc = (geo.get("countryCode") or "").upper()
             if cc != want:
                 return False
-        if self.config.get("pool_reject_proxy", True) and geo.get("proxy"):
+        if self.config.get("pool_reject_proxy", False) and geo.get("proxy"):
             return False
         if self.config.get("pool_reject_hosting", True) and geo.get("hosting"):
             return False
         if self.config.get("pool_reject_mobile", True) and geo.get("mobile"):
             return False
+        res = self._residential_score(geo)
+        if self.config.get("pool_require_residential", True) and res <= 0:
+            return False
+        if fraud_score is not None:
+            max_score = int(self.config.get("max_fraud_score", 25))
+            if fraud_score > max_score:
+                return False
         return True
 
     def _lookup_geo_batch(self, ips):
@@ -385,7 +440,7 @@ class VpnManager:
         item["hosting"] = bool(geo.get("hosting"))
         item["mobile"] = bool(geo.get("mobile"))
         item["residential_score"] = self._residential_score(geo)
-        item["residential"] = item["residential_score"] > 0 and not item["proxy"] and not item["hosting"]
+        item["residential"] = item["residential_score"] > 0 and not item["hosting"]
         return item
 
     def _extract_ovpn_remotes(self, node):
@@ -676,10 +731,15 @@ class VpnManager:
         # 连上后再核一次出口画像：日本 / 非VPN / 非机房
         if self.config.get("pool_verify_exit_geo", True):
             geos = self._lookup_geo_batch([ip])
-            geo = geos.get(ip)
-            if not self._geo_passes(geo or {}):
-                self.log(f"出口画像不合格，断开并剔除: {ip} geo={geo}")
-                self._mark_node_bad(ip, "exit geo rejected")
+            geo = geos.get(ip) or {}
+            use_fraud = (
+                (self.config.get("fraud_provider") or "none").lower() not in ("", "none")
+                and bool((self.config.get("fraud_api_key") or "").strip())
+            )
+            fraud_score = self._lookup_fraud_score(ip) if use_fraud else None
+            if not self._geo_passes(geo, fraud_score=fraud_score):
+                self.log(f"出口画像不合格，断开并剔除: {ip} geo={geo} fraud={fraud_score}")
+                self._mark_node_bad(ip, "exit geo/fraud rejected")
                 self.disconnect()
                 return False
 
@@ -1123,30 +1183,49 @@ class VpnManager:
 
             geos = self._lookup_geo_batch(list(by_ip.keys()))
             qualified = []
-            dropped = {"country": 0, "proxy": 0, "hosting": 0, "mobile": 0, "unknown": 0}
+            dropped = {
+                "country": 0, "proxy": 0, "hosting": 0, "mobile": 0,
+                "residential": 0, "fraud": 0, "unknown": 0,
+            }
+            use_fraud = (
+                (self.config.get("fraud_provider") or "none").lower() not in ("", "none")
+                and bool((self.config.get("fraud_api_key") or "").strip())
+            )
             for ip, node in by_ip.items():
                 geo = geos.get(ip)
                 if not geo:
                     dropped["unknown"] += 1
                     continue
-                if not self._geo_passes(geo):
-                    if (geo.get("countryCode") or "").upper() != (self.config.get("pool_country") or "JP").upper():
+                fraud_score = self._lookup_fraud_score(ip) if use_fraud else None
+                if not self._geo_passes(geo, fraud_score=fraud_score):
+                    want = (self.config.get("pool_country") or "JP").upper()
+                    if (geo.get("countryCode") or "").upper() != want:
                         dropped["country"] += 1
-                    elif geo.get("proxy"):
-                        dropped["proxy"] += 1
-                    elif geo.get("hosting"):
+                    elif geo.get("hosting") and self.config.get("pool_reject_hosting", True):
                         dropped["hosting"] += 1
-                    elif geo.get("mobile"):
+                    elif geo.get("mobile") and self.config.get("pool_reject_mobile", True):
                         dropped["mobile"] += 1
+                    elif self.config.get("pool_reject_proxy", False) and geo.get("proxy"):
+                        dropped["proxy"] += 1
+                    elif self.config.get("pool_require_residential", True) and self._residential_score(geo) <= 0:
+                        dropped["residential"] += 1
+                    elif fraud_score is not None and fraud_score > int(self.config.get("max_fraud_score", 25)):
+                        dropped["fraud"] += 1
                     else:
                         dropped["unknown"] += 1
                     continue
-                qualified.append(self._attach_geo(node, geo))
+                item = self._attach_geo(node, geo)
+                if fraud_score is not None:
+                    item["fraud_score"] = fraud_score
+                qualified.append(item)
 
-            # 家宽优先，再按原质量分
             if self.config.get("pool_prefer_residential", True):
                 qualified.sort(
-                    key=lambda n: (n.get("residential_score") or 0, self._node_quality_tuple(n)),
+                    key=lambda n: (
+                        n.get("residential_score") or 0,
+                        -(n.get("fraud_score") if n.get("fraud_score") is not None else 0),
+                        self._node_quality_tuple(n),
+                    ),
                     reverse=True,
                 )
             else:
@@ -1159,9 +1238,10 @@ class VpnManager:
                 self._available_nodes = ranked
             res_n = sum(1 for n in ranked if n.get("residential"))
             self.log(
-                f"IP 池已更新：{len(ranked)} 个（家宽优先 {res_n}），"
-                f"剔除 国家{dropped['country']} 代理{dropped['proxy']} "
-                f"机房{dropped['hosting']} 移动{dropped['mobile']} 未知{dropped['unknown']}"
+                f"IP 池已更新：{len(ranked)} 个（家宽 {res_n}），"
+                f"剔除 国家{dropped['country']} 机房{dropped['hosting']} "
+                f"移动{dropped['mobile']} 非家宽{dropped['residential']} "
+                f"欺诈{dropped['fraud']} 代理{dropped['proxy']} 未知{dropped['unknown']}"
             )
             return self.get_ip_pool()
         finally:
@@ -1424,8 +1504,8 @@ class VpnManager:
             break
 
         # 出口质量过滤开启时，不允许回退到未检测节点（否则会连上美国/被标 VPN 的地址）
-        if self.config.get("pool_reject_proxy", True):
-            self.log("自动连接失败：合格 IP 池暂无可用节点（日本/非VPN/非机房且能连上的太少）")
+        if self.config.get("pool_require_residential", True) or self.config.get("pool_reject_hosting", True):
+            self.log("自动连接失败：合格 IP 池暂无可用节点（日本家宽/低欺诈且能连上的太少）")
             return False, "合格 IP 池暂无可用节点"
 
         # ---------- 普通节点列表（按质量优选） ----------

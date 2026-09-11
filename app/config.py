@@ -48,20 +48,26 @@ DEFAULT_CONFIG = {
     "pool_probe_limit": 200,
     "pool_max_size": 100,
     "api_token": "",
-    # 出口质量：日本 + 非代理/VPN + 非机房，优先家宽
+    # 出口质量：日本 + 家宽为主；代理标记可放行；欺诈分可选
     "pool_country": "JP",
-    "pool_reject_proxy": True,
+    "pool_reject_proxy": False,
     "pool_reject_hosting": True,
     "pool_reject_mobile": True,
     "pool_prefer_residential": True,
+    "pool_require_residential": True,
     "pool_geo_cache_ttl": 21600,
     "pool_min_size": 3,
     "pool_verify_exit_geo": True,
     "openvpn_connect_timeout": 18,
+    # 欺诈/纯净度：配了 key 才启用。provider: ipqs | proxycheck | none
+    "fraud_provider": "none",
+    "fraud_api_key": "",
+    "max_fraud_score": 25,
+    "fraud_cache_ttl": 86400,
 }
 
 # 不应通过 API 返回给前端的敏感字段
-SENSITIVE_KEYS = {"web_password", "vpn_pass", "secret_key", "api_token"}
+SENSITIVE_KEYS = {"web_password", "vpn_pass", "secret_key", "api_token", "fraud_api_key"}
 
 
 def load_config():
