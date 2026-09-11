@@ -72,7 +72,7 @@ docker compose up -d --build
 - **代理/VPN 标记默认放行**（`pool_reject_proxy=false`）
 - **机房/托管 = 否**，非移动网络
 - **要求像家宽**（ISP/ASN 启发式，KDDI/NTT/SoftBank 等优先）
-- 欺诈分：配置后默认只用于排序（`fraud_hard_filter=false`）；`pool_probe_limit<=0` 表示探测全部候选
+- 欺诈分：配置 Key 后**硬过滤**，默认 `max_fraud_score=40`（`fraud_hard_filter=true`）；`pool_probe_limit<=0` 表示探测全部候选
 
  VPN Gate 节点，维护 **IP 池**；对外仍是 **一条 SOCKS5 隧道**。你的程序需要换出口时调用换 IP 接口，服务端从池里选一个新节点切换。
 

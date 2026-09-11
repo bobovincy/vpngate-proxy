@@ -405,8 +405,8 @@ class VpnManager:
             return False
         if (
             fraud_score is not None
-            and self.config.get("fraud_hard_filter", False)
-            and fraud_score > int(self.config.get("max_fraud_score", 75))
+            and self.config.get("fraud_hard_filter", True)
+            and fraud_score > int(self.config.get("max_fraud_score", 40))
         ):
             return False
         return True
@@ -1257,8 +1257,8 @@ class VpnManager:
                         dropped["residential"] += 1
                     elif (
                         fraud_score is not None
-                        and self.config.get("fraud_hard_filter", False)
-                        and fraud_score > int(self.config.get("max_fraud_score", 75))
+                        and self.config.get("fraud_hard_filter", True)
+                        and fraud_score > int(self.config.get("max_fraud_score", 40))
                     ):
                         dropped["fraud"] += 1
                     else:
@@ -1287,7 +1287,7 @@ class VpnManager:
                 self._pool_updated_at = now
                 self._available_nodes = ranked
             res_n = sum(1 for n in ranked if n.get("residential"))
-            hard = bool(self.config.get("fraud_hard_filter", False))
+            hard = bool(self.config.get("fraud_hard_filter", True))
             self.log(
                 f"IP 池已更新：{len(ranked)} 个（家宽 {res_n}，欺诈硬过滤={'开' if hard else '关'}），"
                 f"剔除 国家{dropped['country']} 机房{dropped['hosting']} "

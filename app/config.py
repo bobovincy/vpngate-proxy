@@ -62,8 +62,8 @@ DEFAULT_CONFIG = {
     # 欺诈/纯净度：配了 key 才启用。provider: ipqs | proxycheck | none
     "fraud_provider": "none",
     "fraud_api_key": "",
-    "max_fraud_score": 75,
-    "fraud_hard_filter": False,
+    "max_fraud_score": 40,
+    "fraud_hard_filter": True,
     "fraud_cache_ttl": 86400,
 }
 
