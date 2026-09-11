@@ -381,10 +381,12 @@ class VpnManager:
         res = self._residential_score(geo)
         if self.config.get("pool_require_residential", True) and res <= 0:
             return False
-        if fraud_score is not None:
-            max_score = int(self.config.get("max_fraud_score", 25))
-            if fraud_score > max_score:
-                return False
+        if (
+            fraud_score is not None
+            and self.config.get("fraud_hard_filter", False)
+            and fraud_score > int(self.config.get("max_fraud_score", 75))
+        ):
+            return False
         return True
 
     def _lookup_geo_batch(self, ips):
@@ -1142,10 +1144,18 @@ class VpnManager:
                 self.fetch_nodes()
             region = (self.config.get("pool_country") or self.config.get("region") or "JP")
             candidates = self.filter_nodes(region, viable_only=True, ranked=True)
-            probe_limit = int(self.config.get("pool_probe_limit", self.config.get("check_limit", 80)))
+            # pool_probe_limit<=0 表示探测全部候选；>0 只探质量排序后的前 N 个
+            raw_limit = int(self.config.get("pool_probe_limit", self.config.get("check_limit", 0)))
             max_size = int(self.config.get("pool_max_size", 100))
-            to_probe = candidates[:max(probe_limit, 1)]
-            self.log(f"IP 池刷新：候选 {len(candidates)}，探测前 {len(to_probe)} 个")
+            if raw_limit <= 0:
+                to_probe = list(candidates)
+            else:
+                to_probe = candidates[:raw_limit]
+            self.log(
+                f"IP 池刷新：全表后候选 {len(candidates)} 个"
+                f"（地区={region}），本轮探测 {len(to_probe)} 个"
+                + ("（全部候选）" if raw_limit <= 0 else f"（上限 pool_probe_limit={raw_limit}）")
+            )
 
             passed = []
             from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1209,7 +1219,11 @@ class VpnManager:
                         dropped["proxy"] += 1
                     elif self.config.get("pool_require_residential", True) and self._residential_score(geo) <= 0:
                         dropped["residential"] += 1
-                    elif fraud_score is not None and fraud_score > int(self.config.get("max_fraud_score", 25)):
+                    elif (
+                        fraud_score is not None
+                        and self.config.get("fraud_hard_filter", False)
+                        and fraud_score > int(self.config.get("max_fraud_score", 75))
+                    ):
                         dropped["fraud"] += 1
                     else:
                         dropped["unknown"] += 1
@@ -1223,7 +1237,7 @@ class VpnManager:
                 qualified.sort(
                     key=lambda n: (
                         n.get("residential_score") or 0,
-                        -(n.get("fraud_score") if n.get("fraud_score") is not None else 0),
+                        -(n.get("fraud_score") if n.get("fraud_score") is not None else 999),
                         self._node_quality_tuple(n),
                     ),
                     reverse=True,
@@ -1237,8 +1251,9 @@ class VpnManager:
                 self._pool_updated_at = now
                 self._available_nodes = ranked
             res_n = sum(1 for n in ranked if n.get("residential"))
+            hard = bool(self.config.get("fraud_hard_filter", False))
             self.log(
-                f"IP 池已更新：{len(ranked)} 个（家宽 {res_n}），"
+                f"IP 池已更新：{len(ranked)} 个（家宽 {res_n}，欺诈硬过滤={'开' if hard else '关'}），"
                 f"剔除 国家{dropped['country']} 机房{dropped['hosting']} "
                 f"移动{dropped['mobile']} 非家宽{dropped['residential']} "
                 f"欺诈{dropped['fraud']} 代理{dropped['proxy']} 未知{dropped['unknown']}"
@@ -1649,7 +1664,7 @@ class VpnManager:
                         self.log(f"节点 {node.get('hostname', '未知')} 连接失败，尝试下一个...")
                         time.sleep(1)
                 else:
-                    self.log("合格 IP 池暂无可用节点（日本 + 非VPN + 非机房）")
+                    self.log("合格 IP 池暂无可用节点（日本家宽优先）")
 
             if connected:
                 self.log("VPN 连接成功建立")

@@ -45,7 +45,7 @@ DEFAULT_CONFIG = {
     # IP 池：后台实时探测维护，程序通过 API 换出口
     "pool_enabled": True,
     "pool_refresh_interval": 45,
-    "pool_probe_limit": 200,
+    "pool_probe_limit": 0,
     "pool_max_size": 100,
     "api_token": "",
     # 出口质量：日本 + 家宽为主；代理标记可放行；欺诈分可选
@@ -62,7 +62,8 @@ DEFAULT_CONFIG = {
     # 欺诈/纯净度：配了 key 才启用。provider: ipqs | proxycheck | none
     "fraud_provider": "none",
     "fraud_api_key": "",
-    "max_fraud_score": 25,
+    "max_fraud_score": 75,
+    "fraud_hard_filter": False,
     "fraud_cache_ttl": 86400,
 }
 
