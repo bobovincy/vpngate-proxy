@@ -66,13 +66,15 @@ docker compose up -d --build
 
 服务端后台实时探测
 
-入池条件（默认）：
+入池 / 质量逻辑（对齐 fingerprint-manager 质量文档）：
 
-- 国家默认亚洲常见区：`JP/KR/TW/HK/SG/TH/MY/VN/PH/ID`（`pool_country` 可改）
-- **代理/VPN 标记默认放行**（`pool_reject_proxy=false`）
-- **机房/托管 = 否**，非移动网络
-- **要求像家宽**（ISP/ASN 启发式，KDDI/NTT/SoftBank 等优先）
-- 欺诈分：默认**关闭硬过滤**（`fraud_hard_filter=false`）；若配置了 Key 仍可用于排序；`pool_probe_limit<=0` 表示探测全部候选
+- 起分 80，加减分 + 硬淘汰 → grade S/A/B/C/D（见 `app/ip_quality.py`）
+- 硬淘汰：`opengw/vpngate/softether` PTR、机房 ASN、商业 VPN ASN、Tor 等
+- **适配**：候选本身来自 VPN Gate，故「出现在 VPN Gate 列表」只打标、不硬淘（否则池会全灭）
+- 默认入池：`quality_min_grade=B`，硬淘剔除；画像匹配（约 A/74 家宽锚点）优先排序
+- 国家默认亚洲：`JP/KR/TW/HK/SG/TH/MY/VN/PH/ID`
+- 可选 IPQS：`fraud_provider=ipqs` + `fraud_api_key`
+- `pool_probe_limit<=0` 表示探测全部候选
 
  VPN Gate 节点，维护 **IP 池**；对外仍是 **一条 SOCKS5 隧道**。你的程序需要换出口时调用换 IP 接口，服务端从池里选一个新节点切换。
 

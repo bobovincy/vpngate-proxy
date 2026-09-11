@@ -10,6 +10,7 @@ import threading
 import time
 import logging
 import requests
+from ip_quality import QualityEngine, grade_of
 import ipaddress
 from collections import OrderedDict
 from socks_server import Socks5Server
@@ -55,6 +56,7 @@ class VpnManager:
         self._ip_pool = []              # 探测通过的可用 IP 池（不含完整 ovpn 大字段也可，但保留 config 便于切换）
         self._geo_cache = {}            # ip -> (ts, geo dict)
         self._fraud_cache = {}          # ip -> (ts, score)
+        self._quality_engine = QualityEngine(self.config)
         self._pool_lock = threading.Lock()
         self._pool_updated_at = None
         self._pool_refreshing = False
@@ -62,6 +64,10 @@ class VpnManager:
         self.policy_routing_set = False
         self._failed_ips = set()
         self.preferred_nodes = self.config.get("preferred_nodes", [])
+        if getattr(self, "_quality_engine", None):
+            self._quality_engine.config = self.config
+        else:
+            self._quality_engine = QualityEngine(self.config)
         self.history_file = "/data/connection_history.json"
         self.connection_history = self._load_history()
         self._history_clean_thread = None
@@ -753,19 +759,37 @@ class VpnManager:
         self.log(f"SOCKS5 代理已启动: {self.status['socks']}")
 
         # 连上后再核一次出口画像：日本 / 非VPN / 非机房
-        if self.config.get("pool_verify_exit_geo", True):
-            geos = self._lookup_geo_batch([ip])
-            geo = geos.get(ip) or {}
-            use_fraud = (
-                (self.config.get("fraud_provider") or "none").lower() not in ("", "none")
-                and bool((self.config.get("fraud_api_key") or "").strip())
-            )
-            fraud_score = self._lookup_fraud_score(ip) if use_fraud else None
-            if not self._geo_passes(geo, fraud_score=fraud_score):
-                self.log(f"出口画像不合格，断开并剔除: {ip} geo={geo} fraud={fraud_score}")
-                self._mark_node_bad(ip, "exit geo/fraud rejected")
-                self.disconnect()
-                return False
+        if self.config.get("pool_verify_exit_geo", True) and self.config.get("quality_enabled", True):
+            try:
+                q = self._quality_engine.check(ip, force=True, vpngate_source=True)
+            except Exception as e:
+                self.log(f"出口质量复查失败: {e}")
+                q = None
+            if q:
+                self.status["quality"] = {
+                    "score": q.get("score"),
+                    "grade": q.get("grade"),
+                    "decision": q.get("decision"),
+                    "profile_match": q.get("profile_match"),
+                    "ptr": q.get("quality_ptr"),
+                    "asn": q.get("quality_asn_name"),
+                }
+                min_grade = (self.config.get("quality_min_grade") or "B").upper()
+                grade_rank = {"S": 4, "A": 3, "B": 2, "C": 1, "D": 0}
+                bad = False
+                if self.config.get("quality_reject_hard_fail", True) and q.get("quality_hard_fails"):
+                    bad = True
+                if grade_rank.get(q.get("grade"), 0) < grade_rank.get(min_grade, 2):
+                    bad = True
+                if bad:
+                    self.log(
+                        f"出口质量不合格，断开并剔除: {ip} "
+                        f"{q.get('grade')}/{q.get('score')} hard={q.get('quality_hard_fails')} "
+                        f"mismatch={q.get('profile_mismatch')}"
+                    )
+                    self._mark_node_bad(ip, "exit quality rejected")
+                    self.disconnect()
+                    return False
 
         self.status["connected_since"] = datetime.now(timezone.utc).isoformat()
         self.log(f"已记录连接开始时间: {self.status['connected_since']}")
@@ -1227,72 +1251,91 @@ class VpnManager:
             for n in passed:
                 by_ip[n["ip"]] = n
 
-            geos = self._lookup_geo_batch(list(by_ip.keys()))
+            # ---- 质量评分（文档逻辑）----
             qualified = []
             dropped = {
-                "country": 0, "proxy": 0, "hosting": 0, "mobile": 0,
-                "residential": 0, "fraud": 0, "unknown": 0,
+                "country": 0, "hard_fail": 0, "grade": 0, "probe": 0, "unknown": 0,
             }
-            use_fraud = (
-                (self.config.get("fraud_provider") or "none").lower() not in ("", "none")
-                and bool((self.config.get("fraud_api_key") or "").strip())
-            )
+            min_grade = (self.config.get("quality_min_grade") or "B").upper()
+            grade_rank = {"S": 4, "A": 3, "B": 2, "C": 1, "D": 0}
+            min_rank = grade_rank.get(min_grade, 2)
+            reject_hard = self.config.get("quality_reject_hard_fail", True)
+            quality_on = self.config.get("quality_enabled", True)
+            allowed = self._allowed_countries()
+
             for ip, node in by_ip.items():
-                geo = geos.get(ip)
-                if not geo:
+                if allowed is not None:
+                    # 国家：优先用节点自带 country_short，质量结果可再校验
+                    cc = (node.get("country_short") or "").upper()
+                    if cc and cc not in allowed:
+                        dropped["country"] += 1
+                        continue
+
+                q = None
+                if quality_on:
+                    try:
+                        q = self._quality_engine.check(ip, force=False, vpngate_source=True)
+                    except Exception as e:
+                        self.log(f"质量评分失败 {ip}: {e}")
+                        q = None
+                if not q:
                     dropped["unknown"] += 1
                     continue
-                fraud_score = self._lookup_fraud_score(ip) if use_fraud else None
-                if not self._geo_passes(geo, fraud_score=fraud_score):
-                    allowed = self._allowed_countries()
-                    if allowed is not None and (geo.get("countryCode") or "").upper() not in allowed:
-                        dropped["country"] += 1
-                    elif geo.get("hosting") and self.config.get("pool_reject_hosting", True):
-                        dropped["hosting"] += 1
-                    elif geo.get("mobile") and self.config.get("pool_reject_mobile", True):
-                        dropped["mobile"] += 1
-                    elif self.config.get("pool_reject_proxy", False) and geo.get("proxy"):
-                        dropped["proxy"] += 1
-                    elif self.config.get("pool_require_residential", True) and self._residential_score(geo) <= 0:
-                        dropped["residential"] += 1
-                    elif (
-                        fraud_score is not None
-                        and self.config.get("fraud_hard_filter", False)
-                        and fraud_score > int(self.config.get("max_fraud_score", 40))
-                    ):
-                        dropped["fraud"] += 1
-                    else:
-                        dropped["unknown"] += 1
+
+                q_cc = (q.get("quality_country") or "").upper()
+                if allowed is not None and q_cc and q_cc not in allowed:
+                    dropped["country"] += 1
                     continue
-                item = self._attach_geo(node, geo)
-                if fraud_score is not None:
-                    item["fraud_score"] = fraud_score
+
+                if reject_hard and q.get("quality_hard_fails"):
+                    dropped["hard_fail"] += 1
+                    continue
+                if grade_rank.get(q.get("grade"), 0) < min_rank:
+                    dropped["grade"] += 1
+                    continue
+
+                item = self._slim_pool_node(node, probed=True)
+                # 附带质量字段（API 可见）
+                for k in (
+                    "score", "grade", "decision", "quality_flags", "quality_hard_fails",
+                    "quality_asn", "quality_asn_name", "quality_asn_type", "quality_ptr",
+                    "quality_country", "profile_match", "profile_mismatch",
+                    "quality_used_ipqs", "quality_fraud_score", "quality_checked_at",
+                ):
+                    if k == "score":
+                        item["quality_score"] = q.get("score")
+                        item["score"] = node.get("score", "")  # 保留 VPN Gate 原始 score 字段名冲突
+                        item["q_score"] = q.get("score")
+                    elif k in q:
+                        item[k] = q.get(k)
+                item["grade"] = q.get("grade")
+                item["decision"] = q.get("decision")
+                item["profile_match"] = q.get("profile_match")
+                item["isp"] = q.get("quality_asn_name") or item.get("isp") or ""
+                item["residential"] = bool(q.get("profile_match") or "ptr_residential" in (q.get("quality_flags") or []))
                 qualified.append(item)
 
-            if self.config.get("pool_prefer_residential", True):
-                qualified.sort(
-                    key=lambda n: (
-                        n.get("residential_score") or 0,
-                        -(n.get("fraud_score") if n.get("fraud_score") is not None else 999),
-                        self._node_quality_tuple(n),
-                    ),
-                    reverse=True,
-                )
-            else:
-                qualified = self.rank_nodes(qualified)
+            # 排序：画像匹配 > 分数 > grade
+            prefer_profile = self.config.get("quality_prefer_profile_match", True)
+            qualified.sort(
+                key=lambda n: (
+                    1 if (prefer_profile and n.get("profile_match")) else 0,
+                    n.get("q_score") or 0,
+                    grade_rank.get(n.get("grade"), 0),
+                ),
+                reverse=True,
+            )
             ranked = qualified[:max_size]
             now = datetime.now(timezone.utc).isoformat()
             with self._pool_lock:
                 self._ip_pool = ranked
                 self._pool_updated_at = now
                 self._available_nodes = ranked
-            res_n = sum(1 for n in ranked if n.get("residential"))
-            hard = bool(self.config.get("fraud_hard_filter", False))
+            match_n = sum(1 for n in ranked if n.get("profile_match"))
             self.log(
-                f"IP 池已更新：{len(ranked)} 个（家宽 {res_n}，欺诈硬过滤={'开' if hard else '关'}），"
-                f"剔除 国家{dropped['country']} 机房{dropped['hosting']} "
-                f"移动{dropped['mobile']} 非家宽{dropped['residential']} "
-                f"欺诈{dropped['fraud']} 代理{dropped['proxy']} 未知{dropped['unknown']}"
+                f"IP 池已更新：{len(ranked)} 个（画像匹配 {match_n}，最低等级 {min_grade}），"
+                f"剔除 国家{dropped['country']} 硬淘{dropped['hard_fail']} "
+                f"等级{dropped['grade']} 未知{dropped['unknown']}"
             )
             return self.get_ip_pool()
         finally:

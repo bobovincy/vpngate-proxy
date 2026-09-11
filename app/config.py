@@ -65,7 +65,13 @@ DEFAULT_CONFIG = {
     "max_fraud_score": 40,
     "fraud_hard_filter": False,
     "fraud_cache_ttl": 86400,
+    # 质量评分（对齐 fingerprint-manager 文档）
+    "quality_enabled": True,
+    "quality_reject_hard_fail": True,
+    "quality_min_grade": "B",
+    "quality_prefer_profile_match": True,
 }
+
 
 # 不应通过 API 返回给前端的敏感字段
 SENSITIVE_KEYS = {"web_password", "vpn_pass", "secret_key", "api_token", "fraud_api_key"}
