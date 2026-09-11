@@ -63,7 +63,7 @@ DEFAULT_CONFIG = {
     "fraud_provider": "none",
     "fraud_api_key": "",
     "max_fraud_score": 40,
-    "fraud_hard_filter": True,
+    "fraud_hard_filter": False,
     "fraud_cache_ttl": 86400,
 }
 
