@@ -68,7 +68,7 @@ docker compose up -d --build
 
 入池条件（默认）：
 
-- 国家默认日本+韩国（`pool_country=["JP","KR"]`，可改）
+- 国家默认亚洲常见区：`JP/KR/TW/HK/SG/TH/MY/VN/PH/ID`（`pool_country` 可改）
 - **代理/VPN 标记默认放行**（`pool_reject_proxy=false`）
 - **机房/托管 = 否**，非移动网络
 - **要求像家宽**（ISP/ASN 启发式，KDDI/NTT/SoftBank 等优先）

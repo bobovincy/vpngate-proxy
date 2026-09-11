@@ -301,9 +301,17 @@ class VpnManager:
             "iij", "bbix", "eonet", "opticom", "k-opticom", "dti", "hi-ho",
             "wakwak", "gmobb", "au one", "au hikari", "flets", "フレッツ",
             "光", "fiber", "broadband", "vectant", "ucom", "itscom", "pikara",
-            # 韩国常见家宽
+            # 韩国/台港澳新马泰等常见家宽
             "kt", "korea telecom", "sk broadband", "sk telecom", "lg u+", "lg uplus",
             "lgtelecom", "xpeed", "dacom", "hanaro",
+            "chunghwa", "hinet", "fetnet", "taiwan mobile", "kbro",
+            "pccw", "hkt", "hkbn", "i-cable", "smartone",
+            "singtel", "starhub", "m1 limited",
+            "true online", "ais", "tot public", "3bb",
+            "tm net", "maxis", "time dotcom",
+            "viettel", "vnpt", "fpt",
+            "pldt", "globe telecom", "converge",
+            "telkom", "indihome", "biznet",
         )
         datacenter = (
             "amazon", "aws", "google", "microsoft", "azure", "digitalocean",
@@ -333,7 +341,7 @@ class VpnManager:
             items = [x.strip().upper() for x in str(raw).replace(";", ",").split(",") if x.strip()]
         return set(items) or None
 
-        def _lookup_fraud_score(self, ip):
+    def _lookup_fraud_score(self, ip):
         """查询欺诈分（0-100，越低越干净）。未配置 provider/key 时返回 None。"""
         provider = (self.config.get("fraud_provider") or "none").strip().lower()
         key = (self.config.get("fraud_api_key") or "").strip()
@@ -1552,8 +1560,19 @@ class VpnManager:
             return False, "合格 IP 池暂无可用节点"
 
         # ---------- 普通节点列表（按质量优选） ----------
-        region = self.config.get("pool_country") or self.config.get("region", "JP")
-        nodes = self.filter_nodes(region, viable_only=True, ranked=True)
+        allowed = self._allowed_countries()
+        if allowed is None:
+            region = self.config.get("region") or "all"
+            nodes = self.filter_nodes(region, viable_only=True, ranked=True)
+        elif len(allowed) == 1:
+            region = next(iter(allowed))
+            nodes = self.filter_nodes(region, viable_only=True, ranked=True)
+        else:
+            nodes = [
+                n for n in self.filter_nodes("all", viable_only=True, ranked=False)
+                if (n.get("country_short") or "").upper() in allowed
+            ]
+            nodes = self.rank_nodes(nodes)
         if not nodes:
             self.log("自动连接失败：当前地区没有可用节点")
             return False, "当前地区没有可用节点"
