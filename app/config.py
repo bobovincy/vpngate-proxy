@@ -12,7 +12,7 @@ DEFAULT_CONFIG = {
     "web_port": 8080,
     "vpn_user": "",
     "vpn_pass": "",
-    "region": "JP",
+    "region": "all",
     "node_limit": 200,
     "check_limit": 20,
     "secret_key": "",
@@ -38,7 +38,7 @@ DEFAULT_CONFIG = {
     "max_node_ping": 0,
     "max_node_sessions": 0,
     # 默认略抬高 JP（参考优质住宅线如 KDDI 121.109.x），可在设置里改成 [] 或其它国家
-    "quality_boost_countries": ["JP"],
+    "quality_boost_countries": ["JP", "KR"],
     "connection_history_retention_days": 30,
     "socks_max_connections": 200,
     "reconnect_interval": 30,
@@ -49,7 +49,7 @@ DEFAULT_CONFIG = {
     "pool_max_size": 100,
     "api_token": "",
     # 出口质量：日本 + 家宽为主；代理标记可放行；欺诈分可选
-    "pool_country": "JP",
+    "pool_country": ["JP", "KR"],
     "pool_reject_proxy": False,
     "pool_reject_hosting": True,
     "pool_reject_mobile": True,

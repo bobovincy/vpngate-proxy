@@ -301,6 +301,9 @@ class VpnManager:
             "iij", "bbix", "eonet", "opticom", "k-opticom", "dti", "hi-ho",
             "wakwak", "gmobb", "au one", "au hikari", "flets", "フレッツ",
             "光", "fiber", "broadband", "vectant", "ucom", "itscom", "pikara",
+            # 韩国常见家宽
+            "kt", "korea telecom", "sk broadband", "sk telecom", "lg u+", "lg uplus",
+            "lgtelecom", "xpeed", "dacom", "hanaro",
         )
         datacenter = (
             "amazon", "aws", "google", "microsoft", "azure", "digitalocean",
@@ -319,7 +322,18 @@ class VpnManager:
             score = 1
         return score
 
-    def _lookup_fraud_score(self, ip):
+    def _allowed_countries(self):
+        """支持 pool_country=JP / 'JP,KR' / ['JP','KR']；空或 ALL 表示不限。"""
+        raw = self.config.get("pool_country")
+        if raw is None or raw == "" or str(raw).upper() == "ALL":
+            return None
+        if isinstance(raw, (list, tuple, set)):
+            items = [str(x).strip().upper() for x in raw if str(x).strip()]
+        else:
+            items = [x.strip().upper() for x in str(raw).replace(";", ",").split(",") if x.strip()]
+        return set(items) or None
+
+        def _lookup_fraud_score(self, ip):
         """查询欺诈分（0-100，越低越干净）。未配置 provider/key 时返回 None。"""
         provider = (self.config.get("fraud_provider") or "none").strip().lower()
         key = (self.config.get("fraud_api_key") or "").strip()
@@ -367,10 +381,10 @@ class VpnManager:
     def _geo_passes(self, geo, fraud_score=None):
         if not geo or geo.get("status") != "success":
             return False
-        want = (self.config.get("pool_country") or "JP").upper()
-        if want and want != "ALL":
+        allowed = self._allowed_countries()
+        if allowed is not None:
             cc = (geo.get("countryCode") or "").upper()
-            if cc != want:
+            if cc not in allowed:
                 return False
         if self.config.get("pool_reject_proxy", False) and geo.get("proxy"):
             return False
@@ -1142,8 +1156,22 @@ class VpnManager:
         try:
             if force_fetch or not self.nodes:
                 self.fetch_nodes()
-            region = (self.config.get("pool_country") or self.config.get("region") or "JP")
-            candidates = self.filter_nodes(region, viable_only=True, ranked=True)
+            allowed = self._allowed_countries()
+            if allowed is None:
+                region = self.config.get("region") or "all"
+                candidates = self.filter_nodes(region, viable_only=True, ranked=True)
+                region = region if region != "all" else "ALL"
+            elif len(allowed) == 1:
+                region = next(iter(allowed))
+                candidates = self.filter_nodes(region, viable_only=True, ranked=True)
+            else:
+                # 多国家：先全量 viable，再按国家白名单筛
+                region = ",".join(sorted(allowed))
+                candidates = [
+                    n for n in self.filter_nodes("all", viable_only=True, ranked=False)
+                    if (n.get("country_short") or "").upper() in allowed
+                ]
+                candidates = self.rank_nodes(candidates)
             # pool_probe_limit<=0 表示探测全部候选；>0 只探质量排序后的前 N 个
             raw_limit = int(self.config.get("pool_probe_limit", self.config.get("check_limit", 0)))
             max_size = int(self.config.get("pool_max_size", 100))
@@ -1208,8 +1236,8 @@ class VpnManager:
                     continue
                 fraud_score = self._lookup_fraud_score(ip) if use_fraud else None
                 if not self._geo_passes(geo, fraud_score=fraud_score):
-                    want = (self.config.get("pool_country") or "JP").upper()
-                    if (geo.get("countryCode") or "").upper() != want:
+                    allowed = self._allowed_countries()
+                    if allowed is not None and (geo.get("countryCode") or "").upper() not in allowed:
                         dropped["country"] += 1
                     elif geo.get("hosting") and self.config.get("pool_reject_hosting", True):
                         dropped["hosting"] += 1
